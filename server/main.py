@@ -350,6 +350,10 @@ def create_app(
         allow_headers=["*"],
     )
 
+    @app.get("/")
+    def root() -> dict[str, str]:
+        return {"service": "PiggyLog API", "health": "/health"}
+
     @app.get("/health")
     def health() -> dict[str, bool]:
         return {"ok": True}

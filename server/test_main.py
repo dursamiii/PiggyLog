@@ -90,6 +90,10 @@ def test_conversion_rejects_same_asset(tmp_path, monkeypatch):
 
 def test_login_requires_credentials_and_session_can_be_revoked(tmp_path, monkeypatch):
     with make_client(tmp_path, monkeypatch) as client:
+        assert client.get("/").json() == {
+            "service": "PiggyLog API",
+            "health": "/health",
+        }
         assert client.get("/health").status_code == 200
         assert client.get("/api/v1/summary").status_code == 401
         assert client.post(

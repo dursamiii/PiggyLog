@@ -41,6 +41,28 @@ class _MemoryAuthRepository implements AuthRepository {
   Future<void> saveEntriesCache(String serverUrl, String json) async {
     entriesCache = json;
   }
+
+  @override
+  Future<List<Map<String, dynamic>>> loadEntries(SavedSession session) async => [];
+
+  @override
+  Future<Map<String, dynamic>> createEntry(
+    SavedSession session,
+    Map<String, Object?> entry,
+  ) async => {
+    ...entry,
+    'id': 1,
+    'costBasisIdr': entry['amount'],
+  };
+
+  @override
+  Future<void> deleteEntry(SavedSession session, int id) async {}
+
+  @override
+  Future<Map<String, dynamic>> loadSummary(SavedSession session) async => {
+    'totalIdr': 0,
+    'profitPercent': 0,
+  };
 }
 
 void main() {

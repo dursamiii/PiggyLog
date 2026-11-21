@@ -10,12 +10,13 @@ Set `PIGGYLOG_USERNAME` and `PIGGYLOG_PASSWORD` on the server before starting it
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export PIGGYLOG_USERNAME=alice
-export PIGGYLOG_PASSWORD='use-a-long-unique-password'
-uvicorn main:app --host 127.0.0.1 --port 8080
+export PIGGYLOG_USERNAME=your_username
+export PIGGYLOG_PASSWORD='your_password'
+uvicorn main:app --host 0.0.0.0 --port 5123
 ```
 
 The database path defaults to `piggylog.db` and can be changed with `PIGGYLOG_DATABASE`.
+On desktop or Flutter web running on the server computer, `http://127.0.0.1:5123` is suitable for local development. Android requires HTTPS with a certificate trusted by Android and a hostname that matches the certificate; configure DNS so that hostname resolves to the server, then start Uvicorn with `--ssl-certfile fullchain.pem --ssl-keyfile privkey.pem`. Binding to `0.0.0.0` makes the development server reachable on the local network; do not expose this setup to the public internet. The root page (`/`) points to the health check (`/health`).
 
 ## API
 

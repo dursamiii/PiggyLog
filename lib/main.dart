@@ -344,11 +344,13 @@ extension AssetTypeLabel on AssetType {
 }
 
 class SavingEntry {
-  const SavingEntry({required this.asset, required this.amount, required this.source, required this.date});
+  const SavingEntry({this.id, required this.asset, required this.amount, required this.source, required this.date, this.costBasisIdr});
+  final int? id;
   final AssetType asset;
   final double amount;
   final String source;
   final DateTime date;
+  final double? costBasisIdr;
 
   Map<String, Object> toJson() => {
         'asset': asset.name,
@@ -358,11 +360,20 @@ class SavingEntry {
       };
 
   factory SavingEntry.fromJson(Map<String, dynamic> json) => SavingEntry(
+        id: json['id'] as int?,
         asset: AssetType.values.byName(json['asset'] as String),
         amount: (json['amount'] as num).toDouble(),
-        source: json['source'] as String,
+        source: json['source'] as String? ?? '',
         date: DateTime.parse(json['date'] as String),
+        costBasisIdr: (json['costBasisIdr'] as num?)?.toDouble(),
       );
+
+  Map<String, Object?> toApiJson() => {
+        'asset': asset.name,
+        'amount': amount,
+        'source': source,
+        'date': DateTime(date.year, date.month, date.day).toIso8601String(),
+      };
 }
 
 class SavingsPage extends StatefulWidget {
@@ -385,11 +396,27 @@ class _SavingsPageState extends State<SavingsPage> {
   final _pageController = PageController(initialPage: 1);
   final List<SavingEntry> _entries = [];
   int _page = 1;
+  double _totalIdr = 0;
+  double _profitPercent = 0;
 
   @override
   void initState() {
     super.initState();
     _restoreEntries();
+    _restoreSummary();
+  }
+
+  Future<void> _restoreSummary() async {
+    try {
+      final summary = await widget.repository.loadSummary(widget.session);
+      if (!mounted) return;
+      setState(() {
+        _totalIdr = (summary['totalIdr'] as num?)?.toDouble() ?? 0;
+        _profitPercent = (summary['profitPercent'] as num?)?.toDouble() ?? 0;
+      });
+    } catch (error) {
+      debugPrint('Remote summary unavailable: $error');
+    }
   }
 
   Future<void> _restoreEntries() async {
@@ -430,10 +457,33 @@ class _SavingsPageState extends State<SavingsPage> {
     }
   }
 
-  void _insertEntry(SavingEntry entry) {
-    _entries.add(entry);
-    _entries.sort((a, b) => b.date.compareTo(a.date));
-    _saveEntriesCache();
+  Future<void> _insertEntry(SavingEntry entry) async {
+    final local = SavingEntry(
+      id: DateTime.now().microsecondsSinceEpoch,
+      asset: entry.asset,
+      amount: entry.amount,
+      source: entry.source,
+      date: entry.date,
+    );
+    if (!mounted) return;
+    setState(() {
+      _entries.add(local);
+      _entries.sort((a, b) => b.date.compareTo(a.date));
+    });
+    await _saveEntriesCache();
+    try {
+      final created = await widget.repository.createEntry(widget.session, entry.toApiJson());
+      final saved = SavingEntry.fromJson(created);
+      if (!mounted) return;
+      setState(() {
+        final index = _entries.indexOf(local);
+        if (index >= 0) _entries[index] = saved;
+      });
+      await _saveEntriesCache();
+      await _restoreSummary();
+    } catch (error) {
+      debugPrint('Remote entry unavailable: $error');
+    }
   }
 
   Future<void> _deleteEntry(SavingEntry entry) async {
@@ -449,12 +499,21 @@ class _SavingsPageState extends State<SavingsPage> {
       ),
     );
     if (delete == true) {
-      setState(() => _entries.remove(entry));
-      _saveEntriesCache();
+      if (entry.id == null) return;
+      try {
+        await widget.repository.deleteEntry(widget.session, entry.id!);
+        if (mounted) setState(() => _entries.remove(entry));
+        await _saveEntriesCache();
+      } catch (error) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Tabungan gagal dihapus: $error')),
+          );
+        }
+      }
     }
   }
 
-  double get _totalIdr => _entries.fold(0, (sum, entry) => sum + (entry.asset == AssetType.idr ? entry.amount : 0));
 
   Future<void> _addSaving() async {
     final entry = await showModalBottomSheet<SavingEntry>(
@@ -467,7 +526,7 @@ class _SavingsPageState extends State<SavingsPage> {
         reverseCurve: Curves.easeInCubic,
       ),
       builder: (_) => const _AddSavingSheet());
-    if (entry != null) setState(() => _insertEntry(entry));
+    if (entry != null) await _insertEntry(entry);
   }
 
   void _go(int page) {
@@ -486,7 +545,7 @@ class _SavingsPageState extends State<SavingsPage> {
             onPageChanged: (page) => setState(() => _page = page),
             children: [
               const _PricesPage(),
-              _HomePage(entries: _entries, totalIdr: _totalIdr, onDelete: _deleteEntry),
+              _HomePage(entries: _entries, totalIdr: _totalIdr, profitPercent: _profitPercent, onDelete: _deleteEntry),
               _SettingsPage(serverUrl: widget.session.serverUrl, onLogout: widget.onLogout),
             ],
           ),
@@ -496,15 +555,16 @@ class _SavingsPageState extends State<SavingsPage> {
 }
 
 class _HomePage extends StatelessWidget {
-  const _HomePage({required this.entries, required this.totalIdr, required this.onDelete});
+  const _HomePage({required this.entries, required this.totalIdr, required this.profitPercent, required this.onDelete});
   final List<SavingEntry> entries;
   final double totalIdr;
+  final double profitPercent;
   final ValueChanged<SavingEntry> onDelete;
   @override
   Widget build(BuildContext context) => SafeArea(
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Padding(padding: EdgeInsets.fromLTRB(24, 18, 24, 8), child: Text('PiggyLog', style: TextStyle(fontSize: 21, fontWeight: FontWeight.w700))),
-          Padding(padding: const EdgeInsets.fromLTRB(20, 12, 20, 28), child: _BalanceIsland(totalIdr: totalIdr)),
+          Padding(padding: const EdgeInsets.fromLTRB(20, 12, 20, 28), child: _BalanceIsland(totalIdr: totalIdr, profitPercent: profitPercent)),
           Padding(padding: const EdgeInsets.symmetric(horizontal: 24), child: Text('History', style: Theme.of(context).textTheme.titleLarge)),
           Expanded(child: entries.isEmpty ? const Center(child: Text('No savings yet')) : ListView.separated(
             padding: const EdgeInsets.fromLTRB(16, 10, 16, 120), itemCount: entries.length,
@@ -528,8 +588,9 @@ class _HomePage extends StatelessWidget {
 }
 
 class _BalanceIsland extends StatelessWidget {
-  const _BalanceIsland({required this.totalIdr});
+  const _BalanceIsland({required this.totalIdr, required this.profitPercent});
   final double totalIdr;
+  final double profitPercent;
   @override
   Widget build(BuildContext context) => Container(
         key: const ValueKey('balance-island'),
@@ -538,7 +599,7 @@ class _BalanceIsland extends StatelessWidget {
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('TOTAL SAVINGS', style: Theme.of(context).textTheme.labelMedium?.copyWith(letterSpacing: 1.2, color: Colors.black54)),
           const SizedBox(height: 8), Text('Rp ${_formatAmount(totalIdr)}', style: Theme.of(context).textTheme.headlineLarge?.copyWith(fontWeight: FontWeight.w700)),
-          const SizedBox(height: 8), Text('+0% overall', style: TextStyle(color: Theme.of(context).colorScheme.primary, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8), Text('${profitPercent == 0 ? '+0' : '${profitPercent >= 0 ? '+' : ''}${profitPercent.toStringAsFixed(2)}'}% overall', style: TextStyle(color: Theme.of(context).colorScheme.primary, fontWeight: FontWeight.w600)),
         ]),
       );
 }

@@ -3,6 +3,7 @@
 *.log
 *.pyc
 __pycache__/
+server/*.pem
 *.swp
 .DS_Store
 .atom/

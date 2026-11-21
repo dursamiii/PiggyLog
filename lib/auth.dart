@@ -18,6 +18,17 @@ abstract interface class AuthRepository {
   Future<void> logout(SavedSession session);
   Future<String?> loadEntriesCache(String serverUrl);
   Future<void> saveEntriesCache(String serverUrl, String json);
+
+  Future<List<Map<String, dynamic>>> loadEntries(SavedSession session) async =>
+      throw UnimplementedError();
+  Future<Map<String, dynamic>> createEntry(
+    SavedSession session,
+    Map<String, Object?> entry,
+  ) async => throw UnimplementedError();
+  Future<void> deleteEntry(SavedSession session, int id) async =>
+      throw UnimplementedError();
+  Future<Map<String, dynamic>> loadSummary(SavedSession session) async =>
+      throw UnimplementedError();
 }
 
 class ApiException implements Exception {
@@ -173,6 +184,58 @@ class ServerAuthRepository implements AuthRepository {
     final preferences = await _preferences;
     await preferences.setString('$_cacheKeyPrefix${_cacheKey(serverUrl)}', json);
   }
+
+  Future<Map<String, dynamic>> _jsonRequest(
+    SavedSession session,
+    String path, {
+    String method = 'GET',
+    Object? body,
+  }) async {
+    final response = await _request(
+      session.serverUrl,
+      path,
+      token: session.token,
+      method: method,
+      body: body,
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException('Permintaan gagal (HTTP ${response.statusCode}): ${response.body}');
+    }
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> loadEntries(SavedSession session) async {
+    final response = await _request(session.serverUrl, '/api/v1/entries', token: session.token);
+    if (response.statusCode != 200) {
+      throw ApiException('Gagal memuat tabungan (HTTP ${response.statusCode}).');
+    }
+    return (jsonDecode(response.body) as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+  }
+
+  @override
+  Future<Map<String, dynamic>> createEntry(
+    SavedSession session,
+    Map<String, Object?> entry,
+  ) => _jsonRequest(session, '/api/v1/entries', method: 'POST', body: entry);
+
+  @override
+  Future<void> deleteEntry(SavedSession session, int id) async {
+    final response = await _request(
+      session.serverUrl,
+      '/api/v1/entries/$id',
+      token: session.token,
+      method: 'DELETE',
+    );
+    if (response.statusCode != 204) {
+      throw ApiException('Gagal menghapus tabungan (HTTP ${response.statusCode}).');
+    }
+  }
+
+  @override
+  Future<Map<String, dynamic>> loadSummary(SavedSession session) =>
+      _jsonRequest(session, '/api/v1/summary');
 
   String _normalizedServerUrl(String serverUrl) {
     final uri = _serverUri(serverUrl, '');
