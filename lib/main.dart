@@ -4,34 +4,157 @@ import 'dart:convert';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'auth.dart';
 
 void main() => runApp(const PiggyLogApp());
 
-class PiggyLogApp extends StatelessWidget {
+class PiggyLogApp extends StatefulWidget {
   const PiggyLogApp({this.authRepository, super.key});
 
   final AuthRepository? authRepository;
 
   @override
+  State<PiggyLogApp> createState() => _PiggyLogAppState();
+}
+
+class _PiggyLogAppState extends State<PiggyLogApp> {
+  static const _themeModeKey = 'piggylog.theme_mode';
+
+  ThemeMode _themeMode = ThemeMode.light;
+  String? _themePreferenceError;
+  String? _recommendedServerUrl;
+  String? _serverUrlConfigError;
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreThemeMode();
+    _loadRecommendedServerUrl();
+  }
+
+  Future<void> _loadRecommendedServerUrl() async {
+    try {
+      final contents = await rootBundle.loadString('.env');
+      final serverLine = contents
+          .split('\n')
+          .map((line) => line.trim())
+          .firstWhere(
+            (line) => line.startsWith('PIGGYLOG_SERVER_URL='),
+            orElse: () => '',
+          );
+      final serverUrl = serverLine.isEmpty
+          ? ''
+          : serverLine.substring(serverLine.indexOf('=') + 1).trim();
+      final uri = Uri.tryParse(serverUrl);
+      if (uri == null ||
+          uri.scheme != 'https' ||
+          !uri.hasAuthority ||
+          uri.host.isEmpty) {
+        throw const FormatException(
+          'PIGGYLOG_SERVER_URL must be a valid HTTPS URL in .env.',
+        );
+      }
+      if (mounted) setState(() => _recommendedServerUrl = serverUrl);
+    } catch (error) {
+      if (mounted) setState(() => _serverUrlConfigError = error.toString());
+    }
+  }
+
+  Future<void> _restoreThemeMode() async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final savedMode = preferences.getString(_themeModeKey);
+      if (!mounted) return;
+      setState(() {
+        _themeMode = savedMode == 'dark' ? ThemeMode.dark : ThemeMode.light;
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() => _themePreferenceError = error.toString());
+      }
+    }
+  }
+
+  Future<void> _setDarkTheme(bool enabled) async {
+    final previousMode = _themeMode;
+    final newMode = enabled ? ThemeMode.dark : ThemeMode.light;
+    setState(() {
+      _themeMode = newMode;
+      _themePreferenceError = null;
+    });
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final saved = await preferences.setString(
+        _themeModeKey,
+        enabled ? 'dark' : 'light',
+      );
+      if (!saved) throw StateError('Could not save the theme preference.');
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _themeMode = previousMode;
+          _themePreferenceError = error.toString();
+        });
+      }
+      rethrow;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'PiggyLog',
     theme: ThemeData(
-      colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff167c68)),
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: const Color(0xff167c68),
+        brightness: Brightness.light,
+      ),
       useMaterial3: true,
       splashFactory: NoSplash.splashFactory,
       splashColor: Colors.transparent,
       highlightColor: Colors.transparent,
       hoverColor: Colors.transparent,
     ),
-    home: _SessionGate(repository: authRepository ?? ServerAuthRepository()),
+    darkTheme: ThemeData(
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: const Color(0xff167c68),
+        brightness: Brightness.dark,
+      ),
+      useMaterial3: true,
+      splashFactory: NoSplash.splashFactory,
+      splashColor: Colors.transparent,
+      highlightColor: Colors.transparent,
+      hoverColor: Colors.transparent,
+    ),
+    themeMode: _themeMode,
+    home: _SessionGate(
+      repository: widget.authRepository ?? ServerAuthRepository(),
+      darkThemeEnabled: _themeMode == ThemeMode.dark,
+      themePreferenceError: _themePreferenceError,
+      onDarkThemeChanged: _setDarkTheme,
+      recommendedServerUrl: _recommendedServerUrl,
+      serverUrlConfigError: _serverUrlConfigError,
+    ),
   );
 }
 
 class _SessionGate extends StatefulWidget {
-  const _SessionGate({required this.repository});
+  const _SessionGate({
+    required this.repository,
+    required this.darkThemeEnabled,
+    required this.themePreferenceError,
+    required this.onDarkThemeChanged,
+    required this.recommendedServerUrl,
+    required this.serverUrlConfigError,
+  });
   final AuthRepository repository;
+  final bool darkThemeEnabled;
+  final String? themePreferenceError;
+  final Future<void> Function(bool enabled) onDarkThemeChanged;
+  final String? recommendedServerUrl;
+  final String? serverUrlConfigError;
 
   @override
   State<_SessionGate> createState() => _SessionGateState();
@@ -81,21 +204,37 @@ class _SessionGateState extends State<_SessionGate> {
     }
     final session = _session;
     if (session == null) {
-      return LoginPage(repository: widget.repository, onLogin: _onLogin);
+      return LoginPage(
+        repository: widget.repository,
+        onLogin: _onLogin,
+        recommendedServerUrl: widget.recommendedServerUrl,
+        serverUrlConfigError: widget.serverUrlConfigError,
+      );
     }
     return SavingsPage(
       session: session,
       repository: widget.repository,
       onLogout: _logout,
+      darkThemeEnabled: widget.darkThemeEnabled,
+      themePreferenceError: widget.themePreferenceError,
+      onDarkThemeChanged: widget.onDarkThemeChanged,
     );
   }
 }
 
 class LoginPage extends StatefulWidget {
-  const LoginPage({required this.repository, required this.onLogin, super.key});
+  const LoginPage({
+    required this.repository,
+    required this.onLogin,
+    required this.recommendedServerUrl,
+    required this.serverUrlConfigError,
+    super.key,
+  });
 
   final AuthRepository repository;
   final ValueChanged<SavedSession> onLogin;
+  final String? recommendedServerUrl;
+  final String? serverUrlConfigError;
 
   @override
   State<LoginPage> createState() => _LoginPageState();
@@ -107,6 +246,7 @@ class _LoginPageState extends State<LoginPage> {
   final _passwordController = TextEditingController();
   bool _connected = false;
   bool _busy = false;
+  bool _registering = false;
   bool _obscurePassword = true;
   String? _error;
 
@@ -138,6 +278,13 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
+  Future<void> _connectToRecommendedServer() async {
+    final serverUrl = widget.recommendedServerUrl;
+    if (serverUrl == null) return;
+    _serverController.text = serverUrl;
+    await _checkConnection();
+  }
+
   Future<void> _login() async {
     setState(() {
       _busy = true;
@@ -163,15 +310,56 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
+  Future<void> _register() async {
+    final repository = widget.repository;
+    if (repository is! AccountRegistrationRepository) {
+      setState(
+        () => _error = 'Pendaftaran tidak didukung oleh repository ini.',
+      );
+      return;
+    }
+    if (_passwordController.text.length < 8) {
+      setState(() => _error = 'Password harus memiliki minimal 8 karakter.');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final session = await (repository as AccountRegistrationRepository)
+          .register(
+            _serverController.text,
+            _usernameController.text.trim(),
+            _passwordController.text,
+          );
+      if (mounted) widget.onLogin(session);
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _error = error is ApiException
+              ? error.message
+              : 'Pendaftaran gagal. Periksa server dan data akun.';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _submitCredentials() => _registering ? _register() : _login();
+
   @override
   Widget build(BuildContext context) {
     final outline = OutlineInputBorder(
       borderRadius: BorderRadius.circular(18),
-      borderSide: const BorderSide(color: Color(0xffd2d9d6)),
+      borderSide: BorderSide(
+        color: Theme.of(context).colorScheme.outlineVariant,
+      ),
     );
     final decoration = InputDecoration(
       filled: true,
-      fillColor: const Color(0xfff5f7f6),
+      fillColor: Theme.of(context).colorScheme.surfaceContainerHighest,
       border: outline,
       enabledBorder: outline,
       focusedBorder: OutlineInputBorder(
@@ -183,7 +371,7 @@ class _LoginPageState extends State<LoginPage> {
       ),
     );
     return Scaffold(
-      backgroundColor: const Color(0xfff7f8f7),
+      backgroundColor: Theme.of(context).colorScheme.surface,
       body: SafeArea(
         child: Center(
           child: SingleChildScrollView(
@@ -220,6 +408,31 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                   ),
                   const SizedBox(height: 12),
+                  if (!_connected) ...[
+                    OutlinedButton.icon(
+                      key: const ValueKey('recommended-server-button'),
+                      onPressed: _busy || widget.recommendedServerUrl == null
+                          ? null
+                          : _connectToRecommendedServer,
+                      icon: const Icon(Icons.cloud_outlined),
+                      label: const Text("Connect to dursamiii's server"),
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size.fromHeight(48),
+                        shape: const StadiumBorder(),
+                      ),
+                    ),
+                    if (widget.serverUrlConfigError != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(
+                          'Server URL config (.env): ${widget.serverUrlConfigError}',
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 8),
+                  ],
                   FilledButton.icon(
                     key: const ValueKey('check-server-button'),
                     onPressed: _busy ? null : _checkConnection,
@@ -238,9 +451,12 @@ class _LoginPageState extends State<LoginPage> {
                   ),
                   if (_connected) ...[
                     const SizedBox(height: 16),
-                    const Row(
+                    Row(
                       children: [
-                        Icon(Icons.check_circle, color: Color(0xff167c68)),
+                        Icon(
+                          Icons.check_circle,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
                         SizedBox(width: 8),
                         Text('Server terhubung'),
                       ],
@@ -267,7 +483,7 @@ class _LoginPageState extends State<LoginPage> {
                       key: const ValueKey('password-field'),
                       controller: _passwordController,
                       obscureText: _obscurePassword,
-                      onSubmitted: (_) => _busy ? null : _login(),
+                      onSubmitted: (_) => _busy ? null : _submitCredentials(),
                       decoration: decoration.copyWith(
                         labelText: 'Password',
                         prefixIcon: const Icon(Icons.lock_outline),
@@ -285,8 +501,10 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                     const SizedBox(height: 16),
                     FilledButton(
-                      key: const ValueKey('login-button'),
-                      onPressed: _busy ? null : _login,
+                      key: ValueKey(
+                        _registering ? 'register-button' : 'login-button',
+                      ),
+                      onPressed: _busy ? null : _submitCredentials,
                       style: FilledButton.styleFrom(
                         minimumSize: const Size.fromHeight(50),
                         shape: const StadiumBorder(),
@@ -297,8 +515,28 @@ class _LoginPageState extends State<LoginPage> {
                               height: 20,
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
-                          : const Text('Log in'),
+                          : Text(_registering ? 'Create account' : 'Log in'),
                     ),
+                    TextButton(
+                      key: const ValueKey('account-mode-toggle'),
+                      onPressed: _busy
+                          ? null
+                          : () => setState(() {
+                              _registering = !_registering;
+                              _error = null;
+                            }),
+                      child: Text(
+                        _registering
+                            ? 'Already have an account? Log in'
+                            : "Don't have an account? Register",
+                      ),
+                    ),
+                    if (_registering)
+                      Text(
+                        'Username: 3-32 letters, numbers, dots, dashes, or underscores. Password: at least 8 characters.',
+                        style: Theme.of(context).textTheme.bodySmall,
+                        textAlign: TextAlign.center,
+                      ),
                   ],
                   if (_error != null) ...[
                     const SizedBox(height: 12),
@@ -395,12 +633,18 @@ class SavingsPage extends StatefulWidget {
     required this.session,
     required this.repository,
     required this.onLogout,
+    required this.darkThemeEnabled,
+    required this.themePreferenceError,
+    required this.onDarkThemeChanged,
     super.key,
   });
 
   final SavedSession session;
   final AuthRepository repository;
   final Future<void> Function() onLogout;
+  final bool darkThemeEnabled;
+  final String? themePreferenceError;
+  final Future<void> Function(bool enabled) onDarkThemeChanged;
 
   @override
   State<SavingsPage> createState() => _SavingsPageState();
@@ -475,8 +719,8 @@ class _SavingsPageState extends State<SavingsPage> {
         widget.session.serverUrl,
       );
       if (prices != null) _applyPrices(prices);
-    } catch (error) {
-      _setSyncError('Could not read saved prices: $error');
+    } catch (_) {
+      // Ignore an unreadable price cache; retry live fetch silently.
     }
   }
 
@@ -560,19 +804,29 @@ class _SavingsPageState extends State<SavingsPage> {
       a.date.day == b.date.day;
 
   Future<void> _syncPrices() async {
+    Map<String, dynamic> payload;
     try {
-      var payload = await widget.repository.loadPrices(widget.session);
+      payload = await widget.repository.loadPrices(widget.session);
       final prices = payload['prices'];
       if (prices is! Map<String, dynamic> || prices.isEmpty) {
         payload = await widget.repository.refreshPrices(widget.session);
       }
+    } catch (_) {
+      try {
+        payload = await widget.repository.refreshPrices(widget.session);
+      } catch (_) {
+        return;
+      }
+    }
+
+    try {
       _applyPrices(payload);
       await widget.repository.savePricesCache(
         widget.session.serverUrl,
         payload,
       );
-    } catch (error) {
-      _setSyncError('Could not load current prices: $error');
+    } catch (_) {
+      // Keep cached prices and avoid showing startup-only sync errors.
     }
   }
 
@@ -675,8 +929,8 @@ class _SavingsPageState extends State<SavingsPage> {
       );
       await _syncSummary();
       if (mounted) setState(() => _syncError = null);
-    } catch (error) {
-      _showError('Could not refresh prices', error);
+    } catch (_) {
+      // Keep the last cached prices if a refresh fails.
     } finally {
       if (mounted) setState(() => _refreshingPrices = false);
     }
@@ -699,6 +953,8 @@ class _SavingsPageState extends State<SavingsPage> {
   }
 
   Future<void> _addSaving() async {
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
     final entry = await showModalBottomSheet<SavingEntry>(
       context: context,
       isScrollControlled: true,
@@ -729,7 +985,7 @@ class _SavingsPageState extends State<SavingsPage> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    backgroundColor: const Color(0xfff7f8f7),
+    backgroundColor: Theme.of(context).colorScheme.surface,
     body: Stack(
       children: [
         PageView(
@@ -738,7 +994,6 @@ class _SavingsPageState extends State<SavingsPage> {
           children: [
             _PricesPage(
               prices: _prices,
-              error: _syncError,
               refreshing: _refreshingPrices,
               onRefresh: _refreshPrices,
             ),
@@ -754,6 +1009,9 @@ class _SavingsPageState extends State<SavingsPage> {
             _SettingsPage(
               serverUrl: widget.session.serverUrl,
               onLogout: widget.onLogout,
+              darkThemeEnabled: widget.darkThemeEnabled,
+              themePreferenceError: widget.themePreferenceError,
+              onDarkThemeChanged: widget.onDarkThemeChanged,
             ),
           ],
         ),
@@ -806,6 +1064,7 @@ class _HomePage extends StatelessWidget {
         Padding(
           padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
           child: _BalanceIsland(
+            entries: entries,
             totalIdr: totalIdr,
             profitIdr: profitIdr,
             profitPercent: profitPercent,
@@ -820,12 +1079,6 @@ class _HomePage extends StatelessWidget {
                   'History',
                   style: Theme.of(context).textTheme.titleLarge,
                 ),
-              ),
-              IconButton(
-                key: const ValueKey('convert-button'),
-                tooltip: 'Convert assets',
-                onPressed: onConvert,
-                icon: const Icon(Icons.currency_exchange),
               ),
             ],
           ),
@@ -842,120 +1095,333 @@ class _HomePage extends StatelessWidget {
         Expanded(
           child: entries.isEmpty
               ? const Center(child: Text('No savings yet'))
-              : ListView.separated(
-                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 120),
-                  itemCount: entries.length,
-                  separatorBuilder: (_, index) => const SizedBox(height: 4),
-                  itemBuilder: (context, index) {
-                    final entry = entries[index];
-                    return GestureDetector(
-                      onLongPress: () => onDelete(entry),
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 4,
-                        ),
-                        leading: CircleAvatar(
-                          child: Icon(
-                            entry.asset == AssetType.gold
-                                ? Icons.circle_outlined
-                                : Icons.savings_outlined,
-                          ),
-                        ),
-                        title: Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            entry.source.isEmpty ? 'Saving' : entry.source,
-                            textAlign: TextAlign.left,
-                          ),
-                        ),
-                        subtitle: Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            '${entry.asset.shortCode} · ${_formatDate(entry.date)}',
-                            textAlign: TextAlign.left,
-                          ),
-                        ),
-                        trailing: Text(
-                          '${entry.asset.symbol}${_formatAmount(entry.amount)}',
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                      ),
-                    );
-                  },
-                ),
+              : _HistoryList(entries: entries, onDelete: onDelete),
         ),
       ],
     ),
   );
 }
 
+class _HistoryList extends StatelessWidget {
+  const _HistoryList({required this.entries, required this.onDelete});
+
+  final List<SavingEntry> entries;
+  final ValueChanged<SavingEntry> onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final sections = _groupHistoryByMonth(entries);
+    final itemCount = sections.fold<int>(
+      0,
+      (count, section) => count + section.entries.length + 1,
+    );
+    return ListView.builder(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 120),
+      itemCount: itemCount,
+      itemBuilder: (context, index) {
+        var remainingIndex = index;
+        for (final section in sections) {
+          if (remainingIndex == 0) {
+            return _HistoryMonthHeader(month: section.month);
+          }
+          remainingIndex--;
+          if (remainingIndex < section.entries.length) {
+            return _HistoryEntryTile(
+              entry: section.entries[remainingIndex],
+              onDelete: onDelete,
+            );
+          }
+          remainingIndex -= section.entries.length;
+        }
+        throw StateError('History item index is out of range.');
+      },
+    );
+  }
+}
+
+class _HistorySection {
+  const _HistorySection({required this.month, required this.entries});
+
+  final DateTime month;
+  final List<SavingEntry> entries;
+}
+
+List<_HistorySection> _groupHistoryByMonth(List<SavingEntry> entries) {
+  final sortedEntries = List<SavingEntry>.of(entries)
+    ..sort((a, b) => b.date.compareTo(a.date));
+  final sections = <_HistorySection>[];
+  for (final entry in sortedEntries) {
+    final month = DateTime(entry.date.year, entry.date.month);
+    if (sections.isEmpty || sections.last.month != month) {
+      sections.add(_HistorySection(month: month, entries: [entry]));
+    } else {
+      sections.last.entries.add(entry);
+    }
+  }
+  return sections;
+}
+
+class _HistoryMonthHeader extends StatelessWidget {
+  const _HistoryMonthHeader({required this.month});
+
+  final DateTime month;
+
+  @override
+  Widget build(BuildContext context) {
+    const months = [
+      'January',
+      'February',
+      'March',
+      'April',
+      'May',
+      'June',
+      'July',
+      'August',
+      'September',
+      'October',
+      'November',
+      'December',
+    ];
+    final colors = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 20, 12, 8),
+      child: Row(
+        children: [
+          Text(
+            '${months[month.month - 1]} ${month.year}',
+            style: Theme.of(context).textTheme.titleSmall
+                ?.copyWith(color: colors.primary, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(width: 12),
+          Expanded(child: Divider(color: colors.outlineVariant)),
+        ],
+      ),
+    );
+  }
+}
+
+class _HistoryEntryTile extends StatelessWidget {
+  const _HistoryEntryTile({required this.entry, required this.onDelete});
+
+  final SavingEntry entry;
+  final ValueChanged<SavingEntry> onDelete;
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+    onLongPress: () => onDelete(entry),
+    child: ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      leading: _AssetAvatar(asset: entry.asset),
+      title: Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          entry.source.isEmpty ? 'Saving' : entry.source,
+          textAlign: TextAlign.left,
+        ),
+      ),
+      subtitle: Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          '${entry.asset.shortCode} · ${_formatDate(entry.date)}',
+          textAlign: TextAlign.left,
+        ),
+      ),
+      trailing: Text(
+        '${entry.asset.symbol}${_formatAmount(entry.amount)}',
+        style: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+    ),
+  );
+}
+
+class _AssetAvatar extends StatelessWidget {
+  const _AssetAvatar({required this.asset});
+
+  final AssetType asset;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final Widget mark = switch (asset) {
+      AssetType.idr => Text(
+        'Rp',
+        style: TextStyle(
+          color: colors.onSecondaryContainer,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      AssetType.sar => Text(
+        'ر.س',
+        style: TextStyle(
+          color: colors.onTertiaryContainer,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      AssetType.usd => Icon(
+        Icons.attach_money,
+        color: colors.onPrimaryContainer,
+      ),
+      AssetType.gold => const CustomPaint(
+        size: Size(25, 21),
+        painter: _GoldBarPainter(),
+      ),
+    };
+    final background = switch (asset) {
+      AssetType.idr => colors.secondaryContainer,
+      AssetType.sar => colors.tertiaryContainer,
+      AssetType.usd => colors.primaryContainer,
+      AssetType.gold => colors.surfaceContainerHighest,
+    };
+    return CircleAvatar(backgroundColor: background, child: mark);
+  }
+}
+
+class _GoldBarPainter extends CustomPainter {
+  const _GoldBarPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final bar = Path()
+      ..moveTo(size.width * .2, size.height * .18)
+      ..lineTo(size.width * .8, size.height * .18)
+      ..lineTo(size.width * .98, size.height * .88)
+      ..lineTo(size.width * .02, size.height * .88)
+      ..close();
+    canvas.drawPath(
+      bar,
+      Paint()
+        ..color = const Color(0xffe6ad3d)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawPath(
+      bar,
+      Paint()
+        ..color = const Color(0xffa66a13)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.4,
+    );
+    canvas.drawLine(
+      Offset(size.width * .28, size.height * .4),
+      Offset(size.width * .72, size.height * .4),
+      Paint()
+        ..color = const Color(0xffffe5a5)
+        ..strokeWidth = 1.4,
+    );
+    canvas.drawLine(
+      Offset(size.width * .18, size.height * .68),
+      Offset(size.width * .82, size.height * .68),
+      Paint()
+        ..color = const Color(0xffbc8122)
+        ..strokeWidth = 1,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _GoldBarPainter oldDelegate) => false;
+}
+
 class _BalanceIsland extends StatelessWidget {
   const _BalanceIsland({
+    required this.entries,
     required this.totalIdr,
     required this.profitIdr,
     required this.profitPercent,
   });
+
+  final List<SavingEntry> entries;
   final double totalIdr;
   final double profitIdr;
   final double profitPercent;
+
   @override
-  Widget build(BuildContext context) => Container(
-    key: const ValueKey('balance-island'),
-    width: double.infinity,
-    padding: const EdgeInsets.fromLTRB(24, 24, 24, 22),
-    decoration: BoxDecoration(
-      color: const Color(0xffe5eee9),
-      borderRadius: BorderRadius.circular(30),
-      border: Border.all(color: Colors.white, width: 1.5),
-      boxShadow: const [
-        BoxShadow(
-          color: Color(0x12000000),
-          blurRadius: 20,
-          offset: Offset(0, 8),
+  Widget build(BuildContext context) {
+    final balances = <AssetType, double>{};
+    for (final entry in entries) {
+      balances.update(
+        entry.asset,
+        (amount) => amount + entry.amount,
+        ifAbsent: () => entry.amount,
+      );
+    }
+    balances.removeWhere((_, amount) => amount.abs() < 1e-9);
+
+    return Container(
+      key: const ValueKey('balance-island'),
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 22),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(30),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+          width: 1.5,
         ),
-      ],
-    ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'TOTAL SAVINGS',
-          style: Theme.of(context).textTheme.labelMedium
-              ?.copyWith(letterSpacing: 1.2, color: Colors.black54),
-        ),
-        const SizedBox(height: 8),
-        Text(
-          'Rp ${_formatAmount(totalIdr)}',
-          style: Theme.of(context).textTheme.headlineLarge
-              ?.copyWith(fontWeight: FontWeight.w700),
-        ),
-        const SizedBox(height: 8),
-        Text(
-          '${profitIdr >= 0 ? '+' : '-'}Rp ${_formatAmount(profitIdr.abs())} profit · ${profitPercent >= 0 ? '+' : ''}${profitPercent.toStringAsFixed(2)}% overall',
-          key: const ValueKey('profit-summary'),
-          style: TextStyle(
-            color: profitIdr >= 0
-                ? Theme.of(context).colorScheme.primary
-                : Theme.of(context).colorScheme.error,
-            fontWeight: FontWeight.w600,
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x18000000),
+            blurRadius: 20,
+            offset: Offset(0, 8),
           ),
-        ),
-      ],
-    ),
-  );
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'TOTAL SAVINGS',
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              letterSpacing: 1.2,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Rp ${_formatAmount(totalIdr)}',
+            style: Theme.of(context).textTheme.headlineLarge
+                ?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '${profitIdr >= 0 ? '+' : '-'}Rp ${_formatAmount(profitIdr.abs())} profit · ${profitPercent >= 0 ? '+' : ''}${profitPercent.toStringAsFixed(2)}% overall',
+            key: const ValueKey('profit-summary'),
+            style: TextStyle(
+              color: profitIdr >= 0
+                  ? Theme.of(context).colorScheme.primary
+                  : Theme.of(context).colorScheme.error,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          if (balances.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Wrap(
+              key: const ValueKey('currency-balances'),
+              spacing: 12,
+              runSpacing: 4,
+              children: balances.entries.map((balance) {
+                final amount = balance.value;
+                return Text(
+                  '${balance.key.shortCode} ${_formatAmount(amount)}',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                );
+              }).toList(),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 }
 
 class _PricesPage extends StatelessWidget {
   const _PricesPage({
     required this.prices,
-    required this.error,
     required this.refreshing,
     required this.onRefresh,
   });
 
   final Map<String, dynamic> prices;
-  final String? error;
   final bool refreshing;
   final VoidCallback onRefresh;
 
@@ -980,13 +1446,6 @@ class _PricesPage extends StatelessWidget {
             : const Icon(Icons.refresh),
         label: Text(refreshing ? 'Updating…' : 'Refresh prices'),
       ),
-      if (error != null) ...[
-        const SizedBox(height: 8),
-        Text(
-          'Could not load prices: $error',
-          style: TextStyle(color: Theme.of(context).colorScheme.error),
-        ),
-      ],
     ],
   );
 }
@@ -998,16 +1457,28 @@ class _PriceTile extends StatelessWidget {
   Widget build(BuildContext context) => Card(
     child: ListTile(
       title: Text(label),
-      trailing: Text(value, style: const TextStyle(color: Colors.black54)),
+      trailing: Text(
+        value,
+        style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+      ),
     ),
   );
 }
 
 class _SettingsPage extends StatelessWidget {
-  const _SettingsPage({required this.serverUrl, required this.onLogout});
+  const _SettingsPage({
+    required this.serverUrl,
+    required this.onLogout,
+    required this.darkThemeEnabled,
+    required this.themePreferenceError,
+    required this.onDarkThemeChanged,
+  });
 
   final String serverUrl;
   final Future<void> Function() onLogout;
+  final bool darkThemeEnabled;
+  final String? themePreferenceError;
+  final Future<void> Function(bool enabled) onDarkThemeChanged;
 
   @override
   Widget build(BuildContext context) => _SimplePage(
@@ -1015,6 +1486,29 @@ class _SettingsPage extends StatelessWidget {
     icon: Icons.tune,
     children: [
       const ListTile(title: Text('Currency display'), trailing: Text('IDR')),
+      SwitchListTile(
+        key: const ValueKey('dark-theme-switch'),
+        title: const Text('Dark theme'),
+        subtitle: Text(
+          themePreferenceError == null
+              ? 'Use a darker appearance'
+              : 'Could not load or save theme preference: $themePreferenceError',
+        ),
+        secondary: const Icon(Icons.dark_mode_outlined),
+        value: darkThemeEnabled,
+        onChanged: (enabled) async {
+          try {
+            await onDarkThemeChanged(enabled);
+          } catch (error) {
+            if (!context.mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Could not save theme preference: $error'),
+              ),
+            );
+          }
+        },
+      ),
       ListTile(
         title: const Text('Connected server'),
         subtitle: Text(serverUrl),
@@ -1099,7 +1593,8 @@ class _BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final active = Theme.of(context).colorScheme.primary.withOpacity(.14);
+    final colorScheme = Theme.of(context).colorScheme;
+    final active = colorScheme.primary.withOpacity(.14);
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
       child: ClipRRect(
@@ -1110,9 +1605,9 @@ class _BottomNav extends StatelessWidget {
           child: Container(
             height: 68,
             decoration: BoxDecoration(
-              color: const Color(0xffedf1ef).withOpacity(.94),
+              color: colorScheme.surfaceContainer.withOpacity(.94),
               borderRadius: BorderRadius.circular(36),
-              border: Border.all(color: Colors.white, width: 1.2),
+              border: Border.all(color: colorScheme.outlineVariant, width: 1.2),
               boxShadow: const [
                 BoxShadow(
                   color: Color(0x18000000),
@@ -1251,13 +1746,14 @@ class _ConvertSheetState extends State<_ConvertSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     final outline = OutlineInputBorder(
       borderRadius: BorderRadius.circular(18),
-      borderSide: const BorderSide(color: Color(0xffd2d9d6)),
+      borderSide: BorderSide(color: colorScheme.outlineVariant),
     );
     final decoration = InputDecoration(
       filled: true,
-      fillColor: const Color(0xfff5f7f6),
+      fillColor: colorScheme.surfaceContainerHighest,
       border: outline,
       enabledBorder: outline,
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
@@ -1467,19 +1963,18 @@ class _CashGoldToggle extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accent = Theme.of(context).colorScheme.primary;
+    final colorScheme = Theme.of(context).colorScheme;
+    final accent = colorScheme.primary;
     return GestureDetector(
       key: const ValueKey('cash-gold-toggle'),
-      onHorizontalDragEnd: (details) {
-        if (details.primaryVelocity == null || details.primaryVelocity == 0)
-          return;
-        onChanged(details.primaryVelocity! < 0);
-      },
+      onHorizontalDragEnd: (
+        _,
+      ) {}, // Gold input locked until price flow is ready.
       child: Container(
         height: 56,
         padding: const EdgeInsets.all(4),
         decoration: BoxDecoration(
-          color: const Color(0xfff0f2f1),
+          color: colorScheme.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(28),
         ),
         child: LayoutBuilder(
@@ -1495,7 +1990,7 @@ class _CashGoldToggle extends StatelessWidget {
                   width: constraints.maxWidth / 2 - 2,
                   height: 48,
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color: colorScheme.surface,
                     borderRadius: BorderRadius.circular(24),
                     boxShadow: const [
                       BoxShadow(
@@ -1519,10 +2014,10 @@ class _CashGoldToggle extends StatelessWidget {
                   ),
                   Expanded(
                     child: _ModeButton(
-                      label: 'Gold',
-                      active: selectedGold,
-                      color: accent,
-                      onTap: () => onChanged(true),
+                      label: 'Gold · locked',
+                      active: false,
+                      color: colorScheme.onSurfaceVariant,
+                      onTap: () {},
                     ),
                   ),
                 ],
@@ -1551,7 +2046,9 @@ class _ModeButton extends StatelessWidget {
     onPressed: onTap,
     style: TextButton.styleFrom(
       shape: const StadiumBorder(),
-      foregroundColor: active ? color : Colors.black54,
+      foregroundColor: active
+          ? color
+          : Theme.of(context).colorScheme.onSurfaceVariant,
     ),
     child: Text(
       label,
@@ -1583,13 +2080,14 @@ class _CashFields extends StatelessWidget {
   final VoidCallback onPickDate, onSave;
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     final outline = OutlineInputBorder(
       borderRadius: BorderRadius.circular(18),
-      borderSide: const BorderSide(color: Color(0xffd2d9d6), width: 1),
+      borderSide: BorderSide(color: colorScheme.outlineVariant, width: 1),
     );
     final fieldDecoration = InputDecoration(
       filled: true,
-      fillColor: const Color(0xfff5f7f6),
+      fillColor: colorScheme.surfaceContainerHighest,
       border: outline,
       enabledBorder: outline,
       focusedBorder: OutlineInputBorder(
@@ -1628,13 +2126,10 @@ class _CashFields extends StatelessWidget {
                   decoration: fieldDecoration.copyWith(
                     labelText: 'Date',
                     fillColor: today
-                        ? const Color(0xffe9eceb)
-                        : const Color(0xfff3f5f4),
+                        ? colorScheme.surfaceContainer
+                        : colorScheme.surfaceContainerHighest,
                   ),
-                  child: Text(
-                    _formatDate(date),
-                    style: TextStyle(color: today ? Colors.black45 : null),
-                  ),
+                  child: Text(_formatDate(date)),
                 ),
               ),
             ),
