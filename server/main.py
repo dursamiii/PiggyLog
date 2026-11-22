@@ -1,12 +1,13 @@
 import asyncio
 import hashlib
 import logging
+import math
 import os
 import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date as date_type, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -24,26 +25,77 @@ PRICE_REFRESH_INTERVAL_SECONDS = 30 * 60
 
 
 class PriceProvider(Protocol):
-    async def fetch_exchange_rates(self) -> dict[str, float]: ...
+    async def fetch_exchange_rates(
+        self, rate_date: str = "latest"
+    ) -> dict[str, float]: ...
 
     async def fetch_gold_usd_per_gram(self) -> float: ...
 
 
 class LivePriceProvider:
-    async def fetch_exchange_rates(self) -> dict[str, float]:
-        async with httpx.AsyncClient(timeout=12) as client:
-            response = await client.get("https://open.er-api.com/v6/latest/IDR")
-            response.raise_for_status()
-            payload = response.json()
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        self._client = client
 
-        rates = payload.get("rates", {})
+    async def fetch_exchange_rates(
+        self, rate_date: str = "latest"
+    ) -> dict[str, float]:
+        if rate_date != "latest":
+            try:
+                parsed_date = date_type.fromisoformat(rate_date)
+            except ValueError as error:
+                raise ValueError("Exchange-rate date must use YYYY-MM-DD") from error
+            if parsed_date.isoformat() != rate_date:
+                raise ValueError("Exchange-rate date must use YYYY-MM-DD")
+
+        urls = (
+            f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{rate_date}/v1/currencies/idr.json",
+            f"https://{rate_date}.currency-api.pages.dev/v1/currencies/idr.json",
+        )
+        errors: list[Exception] = []
+        for url in urls:
+            try:
+                payload = await self._get_json(url)
+                return self._parse_exchange_rates(payload, rate_date)
+            except (httpx.HTTPError, ValueError, KeyError, TypeError, ZeroDivisionError) as error:
+                errors.append(error)
+                logger.warning("Exchange-rate request failed for %s: %s", url, error)
+
+        raise ValueError(
+            f"Unable to load exchange rates for {rate_date} from both exchange-api URLs"
+        ) from errors[-1]
+
+    async def _get_json(self, url: str) -> object:
+        if self._client is not None:
+            response = await self._client.get(url)
+        else:
+            async with httpx.AsyncClient(timeout=12) as client:
+                response = await client.get(url)
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _parse_exchange_rates(payload: object, requested_date: str) -> dict[str, float]:
+        if not isinstance(payload, dict):
+            raise ValueError("Exchange-api response must be a JSON object")
+        if requested_date != "latest" and payload.get("date") != requested_date:
+            raise ValueError(
+                f"Exchange-api returned {payload.get('date')!r} for {requested_date}"
+            )
+        idr_rates = payload.get("idr")
+        if not isinstance(idr_rates, dict):
+            raise ValueError("Exchange-api response did not contain IDR rates")
         try:
-            idr_per_usd = 1 / float(rates["USD"])
-            idr_per_sar = 1 / float(rates["SAR"])
+            usd_per_idr = float(idr_rates["usd"])
+            sar_per_idr = float(idr_rates["sar"])
+            idr_per_usd = 1 / usd_per_idr
+            idr_per_sar = 1 / sar_per_idr
         except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
-            raise ValueError("Exchange-rate response did not contain valid IDR rates") from error
-        if idr_per_usd <= 0 or idr_per_sar <= 0:
-            raise ValueError("Exchange-rate response contained non-positive rates")
+            raise ValueError("Exchange-api response did not contain valid USD/SAR rates") from error
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in (idr_per_usd, idr_per_sar)
+        ):
+            raise ValueError("Exchange-api response contained non-positive or invalid rates")
         return {"idr": 1.0, "usd": idr_per_usd, "sar": idr_per_sar}
 
     async def fetch_gold_usd_per_gram(self) -> float:
@@ -142,6 +194,14 @@ class Database:
                     source TEXT NOT NULL,
                     fetched_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS historical_price_snapshots (
+                    date TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    idr_per_unit REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY (date, symbol)
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY,
                     expires_at TEXT NOT NULL,
@@ -215,6 +275,34 @@ class Database:
                 [(symbol, price, source, fetched_at) for symbol, price in prices.items()],
             )
 
+    def historical_prices(self, rate_date: str) -> dict[str, float]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT symbol, idr_per_unit FROM historical_price_snapshots
+                WHERE date = ?
+                """,
+                (rate_date,),
+            ).fetchall()
+        return {row["symbol"]: float(row["idr_per_unit"]) for row in rows}
+
+    def save_historical_prices(
+        self, rate_date: str, prices: dict[str, float], source: str
+    ) -> None:
+        fetched_at = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO historical_price_snapshots(
+                    date, symbol, idr_per_unit, source, fetched_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (rate_date, symbol, price, source, fetched_at)
+                    for symbol, price in prices.items()
+                ],
+            )
+
     def price(self, asset: str) -> float:
         if asset == "idr":
             return 1.0
@@ -271,10 +359,13 @@ def create_app(
     async def refresh_prices() -> dict[str, dict[str, object]]:
         failures: list[str] = []
         try:
-            exchange_prices = await provider.fetch_exchange_rates()
-            if any(price <= 0 for price in exchange_prices.values()):
+            exchange_prices = await provider.fetch_exchange_rates("latest")
+            if any(
+                not math.isfinite(price) or price <= 0
+                for price in exchange_prices.values()
+            ):
                 raise ValueError("Exchange-rate provider returned a non-positive price")
-            db.upsert_prices(exchange_prices, "open.er-api.com")
+            db.upsert_prices(exchange_prices, "exchange-api")
         except Exception as error:
             failures.append(f"currencies: {error}")
             logger.warning("Currency price refresh failed: %s", error)
@@ -298,6 +389,57 @@ def create_app(
         if failures:
             logger.warning("Price refresh was partial: %s", "; ".join(failures))
         return prices
+
+    async def historical_unit_price(asset: str, rate_date: str) -> float:
+        if asset == "idr":
+            db.save_historical_prices(rate_date, {"idr": 1.0}, "fixed")
+            return db.historical_prices(rate_date)["idr"]
+
+        snapshots = db.historical_prices(rate_date)
+        required_symbol = "usd" if asset == "gold" else asset
+        if required_symbol not in snapshots:
+            try:
+                exchange_prices = await provider.fetch_exchange_rates(rate_date)
+            except ValueError as error:
+                logger.error(
+                    "Could not load historical exchange rates for %s: %s",
+                    rate_date,
+                    error,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Historical exchange rates are unavailable for {rate_date}",
+                ) from error
+            if any(
+                not math.isfinite(price) or price <= 0
+                for price in exchange_prices.values()
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Historical exchange rates are invalid for {rate_date}",
+                )
+            db.save_historical_prices(rate_date, exchange_prices, "exchange-api")
+            snapshots = db.historical_prices(rate_date)
+
+        if required_symbol not in snapshots:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Historical {asset.upper()} exchange rate is unavailable for {rate_date}",
+            )
+        if asset != "gold":
+            return snapshots[asset]
+        if "gold" in snapshots:
+            return snapshots["gold"]
+
+        # Keep the existing gold quote source and apply the historical USD/IDR rate.
+        gold_usd_per_gram = db.price("gold") / db.price("usd")
+        historical_gold_idr = gold_usd_per_gram * snapshots["usd"]
+        db.save_historical_prices(
+            rate_date,
+            {"gold": historical_gold_idr},
+            "api.gold-api.com + exchange-api",
+        )
+        return db.historical_prices(rate_date)["gold"]
 
     async def scheduled_price_refresh() -> None:
         while True:
@@ -428,12 +570,19 @@ def create_app(
         return [db.entry_dict(row) for row in rows]
 
     @app.post("/api/v1/entries", status_code=status.HTTP_201_CREATED)
-    def create_entry(
+    async def create_entry(
         entry: EntryCreate,
         _: tuple[str, datetime] = Depends(require_session),
     ) -> dict[str, object]:
-        price = db.price(entry.asset)
-        cost_basis = entry.cost_basis_idr or entry.amount * price
+        if entry.cost_basis_idr is not None:
+            cost_basis = entry.cost_basis_idr
+        else:
+            rate_date = entry.date.date().isoformat()
+            if rate_date == datetime.now(UTC).date().isoformat():
+                unit_price = db.price(entry.asset)
+            else:
+                unit_price = await historical_unit_price(entry.asset, rate_date)
+            cost_basis = entry.amount * unit_price
         created_at = datetime.now(UTC).isoformat()
         with db.connect() as connection:
             cursor = connection.execute(

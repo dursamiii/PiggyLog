@@ -14,21 +14,32 @@ class SavedSession {
 abstract interface class AuthRepository {
   Future<SavedSession?> loadSession();
   Future<void> checkConnection(String serverUrl);
-  Future<SavedSession> login(String serverUrl, String username, String password);
+  Future<SavedSession> login(
+    String serverUrl,
+    String username,
+    String password,
+  );
   Future<void> logout(SavedSession session);
   Future<String?> loadEntriesCache(String serverUrl);
   Future<void> saveEntriesCache(String serverUrl, String json);
 
-  Future<List<Map<String, dynamic>>> loadEntries(SavedSession session) async =>
-      throw UnimplementedError();
+  Future<List<Map<String, dynamic>>> loadEntries(SavedSession session);
   Future<Map<String, dynamic>> createEntry(
     SavedSession session,
     Map<String, Object?> entry,
-  ) async => throw UnimplementedError();
-  Future<void> deleteEntry(SavedSession session, int id) async =>
-      throw UnimplementedError();
-  Future<Map<String, dynamic>> loadSummary(SavedSession session) async =>
-      throw UnimplementedError();
+  );
+  Future<void> deleteEntry(SavedSession session, int id);
+  Future<Map<String, dynamic>> loadSummary(SavedSession session);
+  Future<Map<String, dynamic>?> loadSummaryCache(String serverUrl);
+  Future<void> saveSummaryCache(String serverUrl, Map<String, dynamic> summary);
+  Future<Map<String, dynamic>> loadPrices(SavedSession session);
+  Future<Map<String, dynamic>> refreshPrices(SavedSession session);
+  Future<Map<String, dynamic>?> loadPricesCache(String serverUrl);
+  Future<void> savePricesCache(String serverUrl, Map<String, dynamic> prices);
+  Future<Map<String, dynamic>> createConversion(
+    SavedSession session,
+    Map<String, Object?> conversion,
+  );
 }
 
 class ApiException implements Exception {
@@ -44,12 +55,14 @@ class ServerAuthRepository implements AuthRepository {
   ServerAuthRepository({
     http.Client? client,
     FlutterSecureStorage? secureStorage,
-  })  : _client = client ?? http.Client(),
-        _secureStorage = secureStorage ?? const FlutterSecureStorage();
+  }) : _client = client ?? http.Client(),
+       _secureStorage = secureStorage ?? const FlutterSecureStorage();
 
   static const _serverUrlKey = 'piggylog.server_url';
   static const _tokenKey = 'piggylog.session_token';
   static const _cacheKeyPrefix = 'piggylog.entries.';
+  static const _summaryCacheKeyPrefix = 'piggylog.summary.';
+  static const _pricesCacheKeyPrefix = 'piggylog.prices.';
 
   final http.Client _client;
   final FlutterSecureStorage _secureStorage;
@@ -66,7 +79,9 @@ class ServerAuthRepository implements AuthRepository {
         !{'http', 'https'}.contains(parsed.scheme.toLowerCase()) ||
         parsed.query.isNotEmpty ||
         parsed.fragment.isNotEmpty) {
-      throw const ApiException('Masukkan URL server yang valid, termasuk http:// atau https://.');
+      throw const ApiException(
+        'Masukkan URL server yang valid, termasuk http:// atau https://.',
+      );
     }
 
     final basePath = parsed.path.replaceFirst(RegExp(r'/+$'), '');
@@ -89,9 +104,18 @@ class ServerAuthRepository implements AuthRepository {
     };
     final encodedBody = body == null ? null : jsonEncode(body);
     return switch (method) {
-      'POST' => _client.post(uri, headers: requestHeaders, body: encodedBody).timeout(const Duration(seconds: 8)),
-      'DELETE' => _client.delete(uri, headers: requestHeaders).timeout(const Duration(seconds: 8)),
-      _ => _client.get(uri, headers: requestHeaders).timeout(const Duration(seconds: 8)),
+      'POST' =>
+        _client
+            .post(uri, headers: requestHeaders, body: encodedBody)
+            .timeout(const Duration(seconds: 8)),
+      'DELETE' =>
+        _client
+            .delete(uri, headers: requestHeaders)
+            .timeout(const Duration(seconds: 8)),
+      _ =>
+        _client
+            .get(uri, headers: requestHeaders)
+            .timeout(const Duration(seconds: 8)),
     };
   }
 
@@ -99,12 +123,16 @@ class ServerAuthRepository implements AuthRepository {
   Future<void> checkConnection(String serverUrl) async {
     final response = await _request(serverUrl, '/health');
     if (response.statusCode != 200) {
-      throw const ApiException('Server ditemukan, tetapi bukan PiggyLog API yang valid.');
+      throw const ApiException(
+        'Server ditemukan, tetapi bukan PiggyLog API yang valid.',
+      );
     }
     try {
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       if (payload['ok'] != true) {
-        throw const ApiException('Server ditemukan, tetapi bukan PiggyLog API yang valid.');
+        throw const ApiException(
+          'Server ditemukan, tetapi bukan PiggyLog API yang valid.',
+        );
       }
     } on FormatException {
       throw const ApiException('Server mengirim respons yang tidak valid.');
@@ -135,7 +163,9 @@ class ServerAuthRepository implements AuthRepository {
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
     final token = payload['access_token'] as String?;
     if (token == null || token.isEmpty) {
-      throw const ApiException('Respons login tidak berisi session yang valid.');
+      throw const ApiException(
+        'Respons login tidak berisi session yang valid.',
+      );
     }
 
     final normalizedUrl = _normalizedServerUrl(serverUrl);
@@ -164,7 +194,9 @@ class ServerAuthRepository implements AuthRepository {
         method: 'DELETE',
       );
       if (response.statusCode != 204 && response.statusCode != 401) {
-        throw ApiException('Server gagal mengakhiri session (HTTP ${response.statusCode}).');
+        throw ApiException(
+          'Server gagal mengakhiri session (HTTP ${response.statusCode}).',
+        );
       }
     } finally {
       final preferences = await _preferences;
@@ -182,7 +214,63 @@ class ServerAuthRepository implements AuthRepository {
   @override
   Future<void> saveEntriesCache(String serverUrl, String json) async {
     final preferences = await _preferences;
-    await preferences.setString('$_cacheKeyPrefix${_cacheKey(serverUrl)}', json);
+    await preferences.setString(
+      '$_cacheKeyPrefix${_cacheKey(serverUrl)}',
+      json,
+    );
+  }
+
+  @override
+  Future<Map<String, dynamic>> loadPrices(SavedSession session) =>
+      _jsonRequest(session, '/api/v1/prices');
+
+  @override
+  Future<Map<String, dynamic>> refreshPrices(SavedSession session) =>
+      _jsonRequest(session, '/api/v1/prices/refresh', method: 'POST');
+
+  @override
+  Future<Map<String, dynamic>?> loadPricesCache(String serverUrl) =>
+      _loadMapCache('$_pricesCacheKeyPrefix${_cacheKey(serverUrl)}');
+
+  @override
+  Future<void> savePricesCache(String serverUrl, Map<String, dynamic> prices) =>
+      _saveMapCache('$_pricesCacheKeyPrefix${_cacheKey(serverUrl)}', prices);
+
+  @override
+  Future<Map<String, dynamic>?> loadSummaryCache(String serverUrl) =>
+      _loadMapCache('$_summaryCacheKeyPrefix${_cacheKey(serverUrl)}');
+
+  @override
+  Future<void> saveSummaryCache(
+    String serverUrl,
+    Map<String, dynamic> summary,
+  ) => _saveMapCache('$_summaryCacheKeyPrefix${_cacheKey(serverUrl)}', summary);
+
+  @override
+  Future<Map<String, dynamic>> createConversion(
+    SavedSession session,
+    Map<String, Object?> conversion,
+  ) => _jsonRequest(
+    session,
+    '/api/v1/conversions',
+    method: 'POST',
+    body: conversion,
+  );
+
+  Future<Map<String, dynamic>?> _loadMapCache(String key) async {
+    final preferences = await _preferences;
+    final json = preferences.getString(key);
+    if (json == null) return null;
+    final decoded = jsonDecode(json);
+    if (decoded is! Map<String, dynamic>) {
+      throw const ApiException('Data cache lokal tidak valid.');
+    }
+    return decoded;
+  }
+
+  Future<void> _saveMapCache(String key, Map<String, dynamic> value) async {
+    final preferences = await _preferences;
+    await preferences.setString(key, jsonEncode(value));
   }
 
   Future<Map<String, dynamic>> _jsonRequest(
@@ -199,16 +287,24 @@ class ServerAuthRepository implements AuthRepository {
       body: body,
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw ApiException('Permintaan gagal (HTTP ${response.statusCode}): ${response.body}');
+      throw ApiException(
+        'Permintaan gagal (HTTP ${response.statusCode}): ${response.body}',
+      );
     }
     return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
   @override
   Future<List<Map<String, dynamic>>> loadEntries(SavedSession session) async {
-    final response = await _request(session.serverUrl, '/api/v1/entries', token: session.token);
+    final response = await _request(
+      session.serverUrl,
+      '/api/v1/entries',
+      token: session.token,
+    );
     if (response.statusCode != 200) {
-      throw ApiException('Gagal memuat tabungan (HTTP ${response.statusCode}).');
+      throw ApiException(
+        'Gagal memuat tabungan (HTTP ${response.statusCode}).',
+      );
     }
     return (jsonDecode(response.body) as List<dynamic>)
         .cast<Map<String, dynamic>>();
@@ -229,7 +325,9 @@ class ServerAuthRepository implements AuthRepository {
       method: 'DELETE',
     );
     if (response.statusCode != 204) {
-      throw ApiException('Gagal menghapus tabungan (HTTP ${response.statusCode}).');
+      throw ApiException(
+        'Gagal menghapus tabungan (HTTP ${response.statusCode}).',
+      );
     }
   }
 
