@@ -1,6 +1,6 @@
 {
-    "name": "savetrail_app",
-    "short_name": "savetrail_app",
+    "name": "PiggyLog",
+    "short_name": "PiggyLog",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
