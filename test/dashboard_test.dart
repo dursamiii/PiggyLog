@@ -131,35 +131,15 @@ void main() {
     expect(repository.refreshCount, 1);
   });
 
-  testWidgets('submits a gold saving and conversion to the repository', (
-    tester,
-  ) async {
+  testWidgets('gold input remains locked', (tester) async {
     final repository = _DashboardRepository();
     await tester.pumpWidget(PiggyLogApp(authRepository: repository));
     await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const ValueKey('add-tab')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Gold'));
-    await tester.pumpAndSettle();
-    await tester.enterText(find.byKey(const ValueKey('amount-field')), '1,5');
-    await tester.tap(find.text('Save'));
-    await tester.pumpAndSettle();
-    expect(repository.savedEntries.single['asset'], 'gold');
-    expect(repository.savedEntries.single['amount'], 1.5);
-
-    await tester.tap(find.byKey(const ValueKey('convert-button')));
-    await tester.pumpAndSettle();
-    await tester.enterText(
-      find.byKey(const ValueKey('convert-amount-field')),
-      '10',
-    );
-    await tester.tap(find.byKey(const ValueKey('submit-conversion-button')));
-    await tester.pumpAndSettle();
-    expect(repository.conversions.single, {
-      'from_asset': 'idr',
-      'to_asset': 'usd',
-      'amount': 10.0,
-    });
+    expect(find.text('Gold · locked'), findsOneWidget);
+    expect(find.text('Gold savings coming soon'), findsNothing);
+    expect(repository.savedEntries, isEmpty);
   });
 }

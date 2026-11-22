@@ -242,16 +242,11 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Save'), findsOneWidget);
     expect(find.text('Cash'), findsOneWidget);
-    expect(find.text('Gold'), findsOneWidget);
+    expect(find.text('Gold · locked'), findsOneWidget);
     expect(find.text('Today'), findsOneWidget);
     expect(find.text('Source (optional)'), findsOneWidget);
     expect(find.byKey(const ValueKey('balance-island')), findsOneWidget);
-    await tester.tap(find.text('Gold'));
-    await tester.pump();
-    expect(find.text('Currency'), findsOneWidget);
-    expect(find.text('g '), findsOneWidget);
-    await tester.tap(find.text('Cash'));
-    await tester.pump();
+    expect(find.text('Gold · locked'), findsOneWidget);
     expect(find.text('Currency'), findsOneWidget);
     await tester.enterText(
       find.byKey(const ValueKey('amount-field')),
@@ -280,37 +275,4 @@ void main() {
     expect(find.text('Saving'), findsOneWidget);
   });
 
-  testWidgets('records a gold saving and an asset conversion', (tester) async {
-    final repository = _MemoryAuthRepository()
-      ..session = const SavedSession(
-        serverUrl: 'https://piggylog.test',
-        token: 'test-token',
-      );
-    await tester.pumpWidget(PiggyLogApp(authRepository: repository));
-    await tester.pumpAndSettle();
-
-    await tester.tap(find.byKey(const ValueKey('add-tab')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Gold'));
-    await tester.pumpAndSettle();
-    await tester.enterText(find.byKey(const ValueKey('amount-field')), '1,5');
-    await tester.tap(find.text('Save'));
-    await tester.pumpAndSettle();
-    expect(repository.entryRequests.single['asset'], 'gold');
-    expect(repository.entryRequests.single['amount'], 1.5);
-
-    await tester.tap(find.byKey(const ValueKey('convert-button')));
-    await tester.pumpAndSettle();
-    await tester.enterText(
-      find.byKey(const ValueKey('convert-amount-field')),
-      '10',
-    );
-    await tester.tap(find.byKey(const ValueKey('submit-conversion-button')));
-    await tester.pumpAndSettle();
-    expect(repository.conversionRequests.single, {
-      'from_asset': 'idr',
-      'to_asset': 'usd',
-      'amount': 10.0,
-    });
-  });
 }
