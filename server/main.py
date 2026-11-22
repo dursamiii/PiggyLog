@@ -15,13 +15,14 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 logger = logging.getLogger("piggylog")
 
 Asset = Literal["idr", "sar", "usd", "gold"]
 GRAMS_PER_TROY_OUNCE = 31.1034768
 PRICE_REFRESH_INTERVAL_SECONDS = 30 * 60
+PASSWORD_HASH_ITERATIONS = 600_000
 
 
 class PriceProvider(Protocol):
@@ -145,6 +146,31 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=200)
 
 
+class RegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(
+        min_length=3,
+        max_length=32,
+        pattern=r"^[a-zA-Z0-9_.-]+$",
+    )
+    password: str = Field(min_length=8, max_length=200)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return value.strip().casefold()
+
+
+def hash_password(password: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode(),
+        salt,
+        PASSWORD_HASH_ITERATIONS,
+    )
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -167,6 +193,7 @@ class Database:
                 """
                 CREATE TABLE IF NOT EXISTS entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL DEFAULT '',
                     asset TEXT NOT NULL,
                     amount REAL NOT NULL,
                     source TEXT NOT NULL DEFAULT '',
@@ -177,6 +204,7 @@ class Database:
                 );
                 CREATE TABLE IF NOT EXISTS conversions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL DEFAULT '',
                     from_asset TEXT NOT NULL,
                     from_amount REAL NOT NULL,
                     to_asset TEXT NOT NULL,
@@ -204,31 +232,112 @@ class Database:
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY,
+                    username TEXT NOT NULL DEFAULT '',
                     expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    password_salt BLOB NOT NULL,
+                    password_hash BLOB NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 """
             )
+            for table in ("entries", "conversions", "sessions"):
+                columns = {
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                if "username" not in columns:
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN username TEXT NOT NULL DEFAULT ''"
+                    )
 
-    def create_session(self, token: str, expires_at: datetime) -> None:
+            legacy_username = os.environ.get("PIGGYLOG_USERNAME", "").strip()
+            if legacy_username:
+                for table in ("entries", "conversions", "sessions"):
+                    connection.execute(
+                        f"UPDATE {table} SET username = ? WHERE username = ''",
+                        (legacy_username,),
+                    )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entries_user_date ON entries(username, date DESC, id DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversions_user_date ON conversions(username, date DESC, id DESC)"
+            )
+
+    def create_user(self, username: str, salt: bytes, password_hash: bytes) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO sessions(token_hash, expires_at, created_at)
-                VALUES (?, ?, ?)
+                INSERT INTO users(username, password_salt, password_hash, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (username, salt, password_hash, datetime.now(UTC).isoformat()),
+            )
+
+    def user_credentials(self, username: str) -> tuple[bytes, bytes] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT password_salt, password_hash FROM users WHERE username = ?
+                """,
+                (username,),
+            ).fetchone()
+        if row is None:
+            return None
+        return bytes(row["password_salt"]), bytes(row["password_hash"])
+        for table in ("entries", "conversions", "sessions"):
+            columns = {
+                row["name"]
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if "username" not in columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN username TEXT NOT NULL DEFAULT ''"
+                )
+
+        legacy_username = os.environ.get("PIGGYLOG_USERNAME", "").strip()
+        if legacy_username:
+            for table in ("entries", "conversions", "sessions"):
+                connection.execute(
+                    f"UPDATE {table} SET username = ? WHERE username = ''",
+                    (legacy_username,),
+                )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_user_date ON entries(username, date DESC, id DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversions_user_date ON conversions(username, date DESC, id DESC)"
+        )
+
+    def create_session(
+        self,
+        token: str,
+        expires_at: datetime,
+        username: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+            INSERT INTO sessions(token_hash, username, expires_at, created_at)
+            VALUES (?, ?, ?, ?)
                 """,
                 (
                     hashlib.sha256(token.encode()).hexdigest(),
+                username,
                     expires_at.isoformat(),
                     datetime.now(UTC).isoformat(),
                 ),
             )
 
-    def session_expiry(self, token: str) -> datetime | None:
+    def session(self, token: str) -> tuple[datetime, str] | None:
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT expires_at FROM sessions WHERE token_hash = ?",
+            "SELECT expires_at, username FROM sessions WHERE token_hash = ?",
                 (token_hash,),
             ).fetchone()
         if row is None:
@@ -237,7 +346,7 @@ class Database:
         if expires_at <= datetime.now(UTC):
             self.revoke_session(token)
             return None
-        return expires_at
+        return expires_at, row["username"]
 
     def revoke_session(self, token: str) -> None:
         with self.connect() as connection:
@@ -469,21 +578,32 @@ def create_app(
 
     def require_session(
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
-    ) -> tuple[str, datetime]:
+    ) -> tuple[str, datetime, str]:
         if credentials is None or credentials.scheme.lower() != "bearer":
             raise HTTPException(
                 status_code=401,
                 detail="Authentication required",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        expires_at = db.session_expiry(credentials.credentials)
-        if expires_at is None:
+        session = db.session(credentials.credentials)
+        if session is None:
             raise HTTPException(
                 status_code=401,
                 detail="Session is invalid or expired",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return credentials.credentials, expires_at
+        expires_at, username = session
+        return credentials.credentials, expires_at, username
+
+    def create_access_session(username: str) -> dict[str, str]:
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(UTC) + timedelta(days=30)
+        db.create_session(token, expires_at, username)
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_at": expires_at.isoformat(),
+        }
 
     app.add_middleware(
         CORSMiddleware,
@@ -504,75 +624,102 @@ def create_app(
     def login(payload: LoginRequest) -> dict[str, str]:
         configured_username = os.environ.get("PIGGYLOG_USERNAME")
         configured_password = os.environ.get("PIGGYLOG_PASSWORD")
-        if not configured_username or not configured_password:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Server login credentials are not configured",
+        configured_user_matches = bool(
+            configured_username
+            and configured_password
+            and secrets.compare_digest(
+                payload.username.encode(), configured_username.encode()
             )
-        username_matches = secrets.compare_digest(
-            payload.username.encode(), configured_username.encode()
+            and secrets.compare_digest(
+                payload.password.encode(), configured_password.encode()
+            )
         )
-        password_matches = secrets.compare_digest(
-            payload.password.encode(), configured_password.encode()
-        )
-        if not username_matches or not password_matches:
+
+        credentials = db.user_credentials(payload.username)
+        salt, expected_hash = credentials or (bytes(16), bytes(32))
+        registered_user_matches = secrets.compare_digest(
+            hash_password(payload.password, salt),
+            expected_hash,
+        ) and credentials is not None
+        if not configured_user_matches and not registered_user_matches:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        username = (
+            configured_username
+            if configured_user_matches
+            else payload.username.casefold()
+        )
+        return create_access_session(username)
 
-        token = secrets.token_urlsafe(32)
-        expires_at = datetime.now(UTC) + timedelta(days=30)
-        db.create_session(token, expires_at)
-        return {
-            "access_token": token,
-            "token_type": "bearer",
-            "expires_at": expires_at.isoformat(),
-        }
+    @app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+    def register(payload: RegisterRequest) -> dict[str, str]:
+        configured_username = os.environ.get("PIGGYLOG_USERNAME")
+        if (
+            configured_username
+            and payload.username.casefold() == configured_username.casefold()
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Username is unavailable",
+            )
+
+        salt = secrets.token_bytes(16)
+        password_hash = hash_password(payload.password, salt)
+        try:
+            db.create_user(payload.username, salt, password_hash)
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Username is already registered",
+            ) from error
+        return create_access_session(payload.username)
 
     @app.get("/auth/session")
     def get_session(
-        session: tuple[str, datetime] = Depends(require_session),
+        session: tuple[str, datetime, str] = Depends(require_session),
     ) -> dict[str, object]:
         return {"ok": True, "expiresAt": session[1].isoformat()}
 
     @app.delete("/auth/session", status_code=status.HTTP_204_NO_CONTENT)
     def delete_session(
-        session: tuple[str, datetime] = Depends(require_session),
+        session: tuple[str, datetime, str] = Depends(require_session),
     ) -> Response:
         db.revoke_session(session[0])
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/api/v1/prices")
     def get_prices(
-        _: tuple[str, datetime] = Depends(require_session),
+        _: tuple[str, datetime, str] = Depends(require_session),
     ) -> dict[str, object]:
         return {"prices": db.prices()}
 
     @app.post("/api/v1/prices/refresh")
     async def post_prices_refresh(
-        _: tuple[str, datetime] = Depends(require_session),
+        _: tuple[str, datetime, str] = Depends(require_session),
     ) -> dict[str, object]:
         return {"prices": await refresh_prices()}
 
     @app.get("/api/v1/entries")
     def get_entries(
-        _: tuple[str, datetime] = Depends(require_session),
+        session: tuple[str, datetime, str] = Depends(require_session),
     ) -> list[dict[str, object]]:
         with db.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT id, asset, amount, source, date, cost_basis_idr, kind, created_at
-                FROM entries ORDER BY date DESC, id DESC
-                """
+                FROM entries WHERE username = ? ORDER BY date DESC, id DESC
+                """,
+                (session[2],),
             ).fetchall()
         return [db.entry_dict(row) for row in rows]
 
     @app.post("/api/v1/entries", status_code=status.HTTP_201_CREATED)
     async def create_entry(
         entry: EntryCreate,
-        _: tuple[str, datetime] = Depends(require_session),
+        session: tuple[str, datetime, str] = Depends(require_session),
     ) -> dict[str, object]:
         if entry.cost_basis_idr is not None:
             cost_basis = entry.cost_basis_idr
@@ -587,10 +734,12 @@ def create_app(
         with db.connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO entries(asset, amount, source, date, cost_basis_idr, kind, created_at)
-                VALUES (?, ?, ?, ?, ?, 'saving', ?)
+                INSERT INTO entries(
+                    username, asset, amount, source, date, cost_basis_idr, kind, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'saving', ?)
                 """,
                 (
+                    session[2],
                     entry.asset,
                     entry.amount,
                     entry.source.strip(),
@@ -602,20 +751,24 @@ def create_app(
             row = connection.execute(
                 """
                 SELECT id, asset, amount, source, date, cost_basis_idr, kind, created_at
-                FROM entries WHERE id = ?
+                FROM entries WHERE id = ? AND username = ?
                 """,
-                (cursor.lastrowid,),
+                (cursor.lastrowid, session[2]),
             ).fetchone()
         return db.entry_dict(row)
 
     @app.delete("/api/v1/entries/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
     def delete_entry(
         entry_id: int,
-        _: tuple[str, datetime] = Depends(require_session),
+        session: tuple[str, datetime, str] = Depends(require_session),
     ) -> Response:
         with db.connect() as connection:
             entry = connection.execute(
-                "SELECT asset, amount, kind FROM entries WHERE id = ?", (entry_id,)
+                """
+                SELECT asset, amount, kind FROM entries
+                WHERE id = ? AND username = ?
+                """,
+                (entry_id, session[2]),
             ).fetchone()
             if entry is None:
                 raise HTTPException(status_code=404, detail="Entry not found")
@@ -624,20 +777,26 @@ def create_app(
                     status_code=409, detail="Conversion entries cannot be deleted directly"
                 )
             holding = connection.execute(
-                "SELECT COALESCE(SUM(amount), 0) AS amount FROM entries WHERE asset = ?",
-                (entry["asset"],),
+                """
+                SELECT COALESCE(SUM(amount), 0) AS amount FROM entries
+                WHERE asset = ? AND username = ?
+                """,
+                (entry["asset"], session[2]),
             ).fetchone()["amount"]
             if float(holding) + 1e-9 < float(entry["amount"]):
                 raise HTTPException(
                     status_code=409,
                     detail="This saving has already been partially or fully converted",
                 )
-            connection.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+            connection.execute(
+                "DELETE FROM entries WHERE id = ? AND username = ?",
+                (entry_id, session[2]),
+            )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/api/v1/conversions")
     def get_conversions(
-        _: tuple[str, datetime] = Depends(require_session),
+        session: tuple[str, datetime, str] = Depends(require_session),
     ) -> list[dict[str, object]]:
         with db.connect() as connection:
             rows = connection.execute(
@@ -645,15 +804,16 @@ def create_app(
                 SELECT id, from_asset, from_amount, to_asset, to_amount,
                        source_value_idr, target_value_idr, cost_basis_idr,
                        realized_profit_idr, date, created_at
-                FROM conversions ORDER BY date DESC, id DESC
-                """
+                FROM conversions WHERE username = ? ORDER BY date DESC, id DESC
+                """,
+                (session[2],),
             ).fetchall()
         return [db.conversion_dict(row) for row in rows]
 
     @app.post("/api/v1/conversions", status_code=status.HTTP_201_CREATED)
     def create_conversion(
         conversion: ConversionCreate,
-        _: tuple[str, datetime] = Depends(require_session),
+        session: tuple[str, datetime, str] = Depends(require_session),
     ) -> dict[str, object]:
         source_price = db.price(conversion.from_asset)
         target_price = db.price(conversion.to_asset)
@@ -668,9 +828,9 @@ def create_app(
                 """
                 SELECT COALESCE(SUM(amount), 0) AS amount,
                        COALESCE(SUM(cost_basis_idr), 0) AS cost_basis
-                FROM entries WHERE asset = ?
+                FROM entries WHERE asset = ? AND username = ?
                 """,
-                (conversion.from_asset,),
+                (conversion.from_asset, session[2]),
             ).fetchone()
             source_holding = float(holding["amount"])
             if source_holding + 1e-9 < conversion.amount:
@@ -685,12 +845,14 @@ def create_app(
             conversion_cursor = connection.execute(
                 """
                 INSERT INTO conversions(
+                    username,
                     from_asset, from_amount, to_asset, to_amount,
                     source_value_idr, target_value_idr, cost_basis_idr,
                     realized_profit_idr, date, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    session[2],
                     conversion.from_asset,
                     conversion.amount,
                     conversion.to_asset,
@@ -706,11 +868,13 @@ def create_app(
             conversion_id = conversion_cursor.lastrowid
             connection.executemany(
                 """
-                INSERT INTO entries(asset, amount, source, date, cost_basis_idr, kind, created_at)
-                VALUES (?, ?, 'Conversion', ?, ?, 'conversion', ?)
+                INSERT INTO entries(
+                    username, asset, amount, source, date, cost_basis_idr, kind, created_at
+                ) VALUES (?, ?, ?, 'Conversion', ?, ?, 'conversion', ?)
                 """,
                 [
                     (
+                        session[2],
                         conversion.from_asset,
                         -conversion.amount,
                         conversion.date.isoformat(),
@@ -718,6 +882,7 @@ def create_app(
                         created_at,
                     ),
                     (
+                        session[2],
                         conversion.to_asset,
                         target_amount,
                         conversion.date.isoformat(),
@@ -731,28 +896,34 @@ def create_app(
                 SELECT id, from_asset, from_amount, to_asset, to_amount,
                        source_value_idr, target_value_idr, cost_basis_idr,
                        realized_profit_idr, date, created_at
-                FROM conversions WHERE id = ?
+                FROM conversions WHERE id = ? AND username = ?
                 """,
-                (conversion_id,),
+                (conversion_id, session[2]),
             ).fetchone()
         return db.conversion_dict(row)
 
     @app.get("/api/v1/summary")
     def get_summary(
-        _: tuple[str, datetime] = Depends(require_session),
+        session: tuple[str, datetime, str] = Depends(require_session),
     ) -> dict[str, object]:
         with db.connect() as connection:
             entries = connection.execute(
-                "SELECT asset, amount, cost_basis_idr FROM entries"
+                "SELECT asset, amount, cost_basis_idr FROM entries WHERE username = ?",
+                (session[2],),
             ).fetchall()
             realized = connection.execute(
-                "SELECT COALESCE(SUM(realized_profit_idr), 0) AS total FROM conversions"
+                """
+                SELECT COALESCE(SUM(realized_profit_idr), 0) AS total
+                FROM conversions WHERE username = ?
+                """,
+                (session[2],),
             ).fetchone()["total"]
             invested = connection.execute(
                 """
                 SELECT COALESCE(SUM(cost_basis_idr), 0) AS total
-                FROM entries WHERE kind = 'saving'
-                """
+                FROM entries WHERE kind = 'saving' AND username = ?
+                """,
+                (session[2],),
             ).fetchone()["total"]
 
         holdings: dict[str, float] = {}

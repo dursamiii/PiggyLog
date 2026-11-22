@@ -11,6 +11,14 @@ class SavedSession {
   final String token;
 }
 
+abstract interface class AccountRegistrationRepository {
+  Future<SavedSession> register(
+    String serverUrl,
+    String username,
+    String password,
+  );
+}
+
 abstract interface class AuthRepository {
   Future<SavedSession?> loadSession();
   Future<void> checkConnection(String serverUrl);
@@ -51,7 +59,8 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
-class ServerAuthRepository implements AuthRepository {
+class ServerAuthRepository
+    implements AuthRepository, AccountRegistrationRepository {
   ServerAuthRepository({
     http.Client? client,
     FlutterSecureStorage? secureStorage,
@@ -161,6 +170,38 @@ class ServerAuthRepository implements AuthRepository {
     }
 
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
+    return _saveAuthenticatedSession(serverUrl, payload);
+  }
+
+  @override
+  Future<SavedSession> register(
+    String serverUrl,
+    String username,
+    String password,
+  ) async {
+    final response = await _request(
+      serverUrl,
+      '/auth/register',
+      method: 'POST',
+      body: {'username': username, 'password': password},
+    );
+    if (response.statusCode == 409) {
+      throw const ApiException('Username sudah digunakan.');
+    }
+    if (response.statusCode == 422) {
+      throw ApiException('Data pendaftaran tidak valid: ${response.body}');
+    }
+    if (response.statusCode != 201) {
+      throw ApiException('Pendaftaran gagal (HTTP ${response.statusCode}).');
+    }
+    final payload = jsonDecode(response.body) as Map<String, dynamic>;
+    return _saveAuthenticatedSession(serverUrl, payload);
+  }
+
+  Future<SavedSession> _saveAuthenticatedSession(
+    String serverUrl,
+    Map<String, dynamic> payload,
+  ) async {
     final token = payload['access_token'] as String?;
     if (token == null || token.isEmpty) {
       throw const ApiException(
@@ -303,11 +344,14 @@ class ServerAuthRepository implements AuthRepository {
     );
     if (response.statusCode != 200) {
       throw ApiException(
-        'Gagal memuat tabungan (HTTP ${response.statusCode}).',
+        'Gagal memuat tabungan (HTTP ${response.statusCode}): ${response.body}',
       );
     }
-    return (jsonDecode(response.body) as List<dynamic>)
-        .cast<Map<String, dynamic>>();
+    final payload = jsonDecode(response.body);
+    if (payload is! List) {
+      throw const ApiException('Server mengirim format tabungan tidak valid.');
+    }
+    return payload.cast<Map<String, dynamic>>();
   }
 
   @override

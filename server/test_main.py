@@ -126,6 +126,55 @@ def test_login_requires_credentials_and_session_can_be_revoked(tmp_path, monkeyp
         assert client.get("/auth/session").status_code == 401
 
 
+def test_registration_creates_a_user_session_and_supports_login(
+    tmp_path, monkeypatch
+):
+    with make_client(tmp_path, monkeypatch) as client:
+        registration = client.post(
+            "/auth/register",
+            json={"username": "new-user", "password": "secure-password"},
+        )
+        assert registration.status_code == 201
+        token = registration.json()["access_token"]
+        client.headers.update({"Authorization": f"Bearer {token}"})
+        assert client.get("/auth/session").status_code == 200
+
+        assert client.post(
+            "/auth/login",
+            json={"username": "new-user", "password": "incorrect-password"},
+        ).status_code == 401
+        login = client.post(
+            "/auth/login",
+            json={"username": "new-user", "password": "secure-password"},
+        )
+        assert login.status_code == 200
+        assert login.json()["access_token"]
+
+        assert client.post(
+            "/auth/register",
+            json={"username": "New-User", "password": "another-password"},
+        ).status_code == 409
+        assert client.post(
+            "/auth/register",
+            json={"username": "alice", "password": "secure-password"},
+        ).status_code == 409
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"username": "ab", "password": "secure-password"},
+        {"username": "bad name", "password": "secure-password"},
+        {"username": "valid-user", "password": "short"},
+    ],
+)
+def test_registration_validates_username_and_password(
+    tmp_path, monkeypatch, payload
+):
+    with make_client(tmp_path, monkeypatch) as client:
+        assert client.post("/auth/register", json=payload).status_code == 422
+
+
 def test_backdated_saving_uses_immutable_historical_rate_snapshot(
     tmp_path, monkeypatch
 ):
