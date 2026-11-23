@@ -4,6 +4,8 @@
 *.pyc
 __pycache__/
 server/*.pem
+.env
+server/piggylog.db*
 *.swp
 .DS_Store
 .atom/
